@@ -1,0 +1,261 @@
+---
+- hosts: localhost
+  vars:
+   wordpress_db: wordpress
+   wordpress_user: wpuser
+   wordpress_password: Passw0rd@123
+   passwd_mysql_root: Mysqlroot@123
+  tasks:
+
+    - name: Launch DB Instance
+      cloudformation:
+        stack_name: DB
+        state: present
+        region: ap-south-1
+        template: cf-tcsdemo
+        template_parameters:
+           SecurityGroupIDs: 'sg-0d32b2dd63984aa13'
+           SubnetID: 'subnet-029536e126dfa3d45'
+           KeyName: 'tcsdemo'
+        tags: 
+          Name: DBServer
+      register: stack
+    - name: Display Cloudformation stack output 
+      debug: msg="Stack output is {{ stack }}"
+    - name: Display the public IP of DB server Stack
+      debug: msg="{{ stack.stack_outputs.PublicIP }}"
+      register: pip
+    - name: Display the Public IP assigned to DB instance
+      debug: var=pip.msg
+    - name: Map the public to a variable
+      set_fact:
+        db_public_ip: "{{ pip.msg }}"
+    - name: Create AWS Launch config
+      ec2_lc:
+        name: MYTCSDEMOLAUNCH
+        image_id: ami-08e0ca9924195beba
+        key_name: tcsdemo 
+        region: ap-south-1
+        security_groups: sg-0d32b2dd63984aa13
+        instance_type: t2.micro
+        assign_public_ip: yes
+      register: lcconfig
+    - debug: msg="{{ lcconfig }}"
+    - name: Create AWS Autoscaling group
+      ec2_asg:
+        name: wp
+        launch_config_name: MYTCSDEMOLAUNCH
+        region: ap-south-1
+        min_size: 1
+        max_size: 2
+        desired_capacity: 1
+        #vpc_zone_identifier: ['subnet-029536e126dfa3d45','subnet-0ef2a0cc4c93ae930']
+        vpc_zone_identifier: ['subnet-029536e126dfa3d45']
+        health_check_type: EC2
+        health_check_period: 60
+        tags:
+           - Name:  WebServer
+      register: asgconfig
+    - debug: msg="{{ asgconfig.instances }}"
+    - name: Get the public IP of Wordpress Instance
+      ec2_instance_facts:
+          instance_ids:  "{{ asgconfig.instances }}"
+      register: wpip
+    - debug: msg="{{ wpip }}"
+    - debug: msg="{{ wpip.instances[0].public_ip_address }}"
+    - name: Map the public ip to a variable
+      set_fact:
+         wp_public_ip: "{{ wpip.instances[0].public_ip_address }}"
+
+    - name: Install MySQL repository
+      yum:
+         name: "https://dev.mysql.com/get/mysql80-community-release-el7-1.noarch.rpm"
+         state: present
+      remote_user: ec2-user
+      become: yes
+      delegate_to: "{{ db_public_ip }}"
+
+
+    - name: Install MySQL packages
+      yum:
+         name: "{{ packages }}"
+         state: present
+      vars:
+        packages:
+          - mysql-community-server
+          - mysql-community-client
+          - MySQL-python
+      remote_user: ec2-user
+      become: yes
+      delegate_to: "{{ db_public_ip }}"
+  
+    - name: Start MySQLd
+      service: name={{ item }} state=restarted
+      with_items:
+        - mysqld
+      remote_user: ec2-user
+      become: yes
+      delegate_to: "{{ db_public_ip }}"
+  
+    - name: Acquire temporary root password
+      shell: "awk -F': ' '$0 ~ \"temporary password\"{print $2}' /var/log/mysqld.log"
+      remote_user: ec2-user
+      become: yes
+      delegate_to: "{{ db_public_ip }}"
+      register: mysql_root_password_temp
+
+    - name: Set new root password from default temporary password
+      shell: "mysql -e \"SET PASSWORD = '{{ passwd_mysql_root }}';\"
+         --connect-expired-password -uroot -p'{{ mysql_root_password_temp.stdout }}'
+         && touch /root/.my.password.changed"
+      args:
+         creates: /root/.my.password.changed
+      remote_user: ec2-user
+      become: yes
+      delegate_to: "{{ db_public_ip }}"
+
+    - name: Change the MySQL Authentication method
+      shell: "mysql -uroot -p'{{ passwd_mysql_root }}' -e \"ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '{{ passwd_mysql_root }}';\""
+      remote_user: ec2-user
+      become: yes
+      delegate_to: "{{ db_public_ip }}"
+
+    - name: Create mysql database
+      mysql_db: 
+         name: "{{ wordpress_db }}"
+         login_user: root
+         login_password: "{{ passwd_mysql_root }}"
+         state: present
+      remote_user: ec2-user
+      become: yes
+      delegate_to: "{{ db_public_ip }}"
+
+
+    - name: Create mysql user
+      mysql_user:
+        name: "{{ wordpress_user }}"
+        login_user: root
+        login_password: "{{ passwd_mysql_root }}"
+        password: "{{ wordpress_password }}"
+        priv: '*.*:ALL'
+        host: "{{ wp_public_ip }}"
+      ignore_errors: true
+      remote_user: ec2-user
+      become: yes
+      delegate_to: "{{ db_public_ip }}"
+
+
+    - name: Restarting MySQLd
+      service: name={{ item }} state=restarted
+      with_items:
+       - mysqld
+      remote_user: ec2-user
+      become: yes
+      delegate_to: "{{ db_public_ip }}"
+    
+
+
+    - name: Installing Webserver
+      yum: name={{ item }} state=present
+      with_items:
+        - httpd
+      remote_user: ec2-user
+      become: yes
+      delegate_to: "{{ wp_public_ip }}"
+  
+    - name: Install PHP
+      shell: amazon-linux-extras install php7.4
+      remote_user: ec2-user
+      become: yes
+      delegate_to: "{{ wp_public_ip }}"
+
+    - name: Restart Webserver
+      service: name={{ item }} state=restarted enabled=yes
+      with_items:
+        - httpd
+      remote_user: ec2-user
+      become: yes
+      delegate_to: "{{ wp_public_ip }}"
+
+    - name: Downloading Wordpress
+      get_url: url=http://www.wordpress.org/latest.tar.gz  dest=/tmp/wordpress.tar
+      remote_user: ec2-user
+      become: yes
+      delegate_to: "{{ wp_public_ip }}"
+
+    - name: Extracting wordpress contents
+      unarchive: src=/tmp/wordpress.tar dest=/tmp/  remote_src=yes
+      remote_user: ec2-user
+      become: yes
+      delegate_to: "{{ wp_public_ip }}"
+
+    - name: Copying wordpress contents to webserver Docroot
+      shell: "cp -r /tmp/wordpress/*  /var/www/html/"
+      remote_user: ec2-user
+      become: yes
+      delegate_to: "{{ wp_public_ip }}"
+
+
+    - name: Copying wp-config.php file
+      copy: src=/var/www/html/wp-config-sample.php  dest=/var/www/html/wp-config.php remote_src=yes
+      remote_user: ec2-user
+      become: yes
+      delegate_to: "{{ wp_public_ip }}"
+
+
+    - name: Removing Wordpress.tar
+      file: path=/tmp/wordpress.tar state=absent
+      remote_user: ec2-user
+      become: yes
+      delegate_to: "{{ wp_public_ip }}"
+
+    - name: Removing Wordpress Extracted Directory
+      file: path=/tmp/wordpress state=absent
+      remote_user: ec2-user
+      become: yes
+      delegate_to: "{{ wp_public_ip }}"
+
+
+    - name: Chaning Doc-root permission
+      shell: 'chown -R apache:apache /var/www/html/'
+      args:
+        warn: false # set warn=false to prevent warning
+      remote_user: ec2-user
+      become: yes
+      delegate_to: "{{ wp_public_ip }}"
+
+    - name: Update WordPress config file
+      shell: sed -i "s/{{ item.name }}/{{ item.value }}/g" /var/www/html/wp-config.php
+      with_items:
+        - { name: "database_name_here", value: "{{ wordpress_db  }}" }
+        - { name: "username_here", value: "{{ wordpress_user }}" }
+        - { name: "password_here", value: "{{ wordpress_password }}" }
+        - { name: "localhost", value: "{{ db_public_ip }}" }
+      remote_user: ec2-user
+      become: yes
+      delegate_to: "{{ wp_public_ip }}"
+
+
+    - name: Download wordpress cli
+      get_url:
+       url: https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
+       dest: /usr/local/bin/wp
+       mode: 0755
+      remote_user: ec2-user
+      become: yes
+      delegate_to: "{{ wp_public_ip }}"
+     
+      #   - name: Run Admin Commands
+      # shell: cd /var/www/html/ && /usr/local/bin/wp core install --url="MuzamilDemo.com"  --title="InfraMind Season 4 - Autonomous IT" --admin_user="admin" --admin_password="adm!n123#" --admin_email="muzamil@tcs.com"
+      # remote_user: ec2-user
+      #become: yes
+      #delegate_to: "{{ wp_public_ip }}"
+
+
+    - name: Restart Webserver
+      service: name={{ item }} state=restarted
+      with_items:
+        - httpd
+      remote_user: ec2-user
+      become: yes
+      delegate_to: "{{ wp_public_ip }}"
